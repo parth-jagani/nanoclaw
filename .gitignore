@@ -34,6 +34,10 @@ groups/*
 # IDE
 .idea/
 .vscode/
+*.code-workspace
+
+# Claude Code local state
+.claude/
 
 # Skills system (local per-installation state)
 .nanoclaw/
