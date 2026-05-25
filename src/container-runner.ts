@@ -411,13 +411,6 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
-  if (providerContribution.env) {
-    for (const [key, value] of Object.entries(providerContribution.env)) {
-      args.push('-e', `${key}=${value}`);
-    }
-  }
-
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
   // are routed through the agent vault for credential injection. Treated as
   // a transient hard failure: if we can't wire the gateway, we don't spawn.
@@ -431,6 +424,14 @@ async function buildContainerArgs(
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
   log.info('OneCLI gateway applied', { containerName });
+
+  // Provider-contributed env vars applied after OneCLI so they take precedence
+  // over anything OneCLI injects (e.g. ANTHROPIC_API_KEY when using subscription).
+  if (providerContribution.env) {
+    for (const [key, value] of Object.entries(providerContribution.env)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
 
   // Host gateway
   args.push(...hostGatewayArgs());
