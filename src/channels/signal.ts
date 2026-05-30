@@ -351,12 +351,131 @@ function resolveMentions(text: string, mentions?: SignalMention[]): string {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Audio analysis — faster-whisper + legacy fallbacks
+// ---------------------------------------------------------------------------
+
+interface AudioAnalysis {
+  transcript: string;
+  durationSeconds: number;
+  wordsPerMinute: number;
+  pauseCount: number;
+  avgPauseDurationSeconds: number;
+  fillerWords: Record<string, number>;
+  segments: Array<{ text: string; start: number; end: number }>;
+}
+
+const FILLER_WORDS = new Set([
+  'um',
+  'uh',
+  'like',
+  'you know',
+  'basically',
+  'literally',
+  'right',
+  'okay',
+  'actually',
+  'just',
+  'so',
+]);
+
+function computeAudioMetrics(
+  words: Array<{ word: string; start: number; end: number }>,
+  durationSeconds: number,
+): Pick<AudioAnalysis, 'wordsPerMinute' | 'pauseCount' | 'avgPauseDurationSeconds' | 'fillerWords'> {
+  const wordsPerMinute = durationSeconds > 0 ? Math.round((words.length / durationSeconds) * 60) : 0;
+
+  const pauses: number[] = [];
+  for (let i = 1; i < words.length; i++) {
+    const gap = words[i].start - words[i - 1].end;
+    if (gap > 0.5) pauses.push(gap);
+  }
+  const pauseCount = pauses.length;
+  const avgPauseDurationSeconds =
+    pauseCount > 0 ? Math.round((pauses.reduce((a, b) => a + b, 0) / pauseCount) * 10) / 10 : 0;
+
+  const fillerWords: Record<string, number> = {};
+  for (const { word } of words) {
+    const clean = word
+      .toLowerCase()
+      .replace(/[^a-z ]/g, '')
+      .trim();
+    if (FILLER_WORDS.has(clean)) fillerWords[clean] = (fillerWords[clean] ?? 0) + 1;
+  }
+
+  return { wordsPerMinute, pauseCount, avgPauseDurationSeconds, fillerWords };
+}
+
 /**
- * Optional voice-note transcription. Tries (in order):
- *   1. local whisper.cpp CLI when `WHISPER_BIN` is set
- *   2. OpenAI Whisper API when `OPENAI_API_KEY` is set
- * Returns null if neither path is configured or transcription fails — caller
- * falls back to a `[Voice Message]` placeholder.
+ * Transcribe and analyze audio using faster-whisper (local Python library).
+ * Returns null if FASTER_WHISPER_MODEL is not set or transcription fails.
+ *
+ * Requires: pip install faster-whisper
+ * The model downloads automatically on first run (~466MB for "small").
+ */
+async function analyzeFasterWhisper(
+  filePath: string,
+  model: string,
+  scriptPath: string,
+): Promise<AudioAnalysis | null> {
+  try {
+    const out = execFileSync('python3', [scriptPath, filePath, model], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 120_000,
+    });
+    const parsed = JSON.parse(out) as {
+      text: string;
+      duration: number;
+      words: Array<{ word: string; start: number; end: number }>;
+      segments: Array<{ text: string; start: number; end: number }>;
+    };
+    if (!parsed.text || parsed.duration == null) return null;
+    const metrics = computeAudioMetrics(parsed.words ?? [], parsed.duration);
+    return {
+      transcript: parsed.text.trim(),
+      durationSeconds: Math.round(parsed.duration),
+      segments: parsed.segments ?? [],
+      ...metrics,
+    };
+  } catch (err) {
+    log.debug('Signal: faster-whisper analysis failed', { err });
+    return null;
+  }
+}
+
+/**
+ * Format duration as m:ss (e.g. 1:23) or just seconds if under 1 minute.
+ */
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+/**
+ * Build the formatted voice message content block from an AudioAnalysis.
+ * First line is the metrics summary header (starts with "[Voice Note") so
+ * the router's engage_pattern "^\[Voice" correctly routes to the voice coach.
+ */
+function formatVoiceContent(analysis: AudioAnalysis, containerAudioPath: string): string {
+  const fillerSummary = Object.entries(analysis.fillerWords)
+    .map(([w, n]) => `${w}×${n}`)
+    .join(', ');
+  const header =
+    [
+      `[Voice Note | ${formatDuration(analysis.durationSeconds)}`,
+      `${analysis.wordsPerMinute} WPM`,
+      `${analysis.pauseCount} pause${analysis.pauseCount !== 1 ? 's' : ''}`,
+      ...(fillerSummary ? [`Fillers: ${fillerSummary}`] : []),
+    ].join(' | ') + ']';
+
+  return `${header}\n\nTranscript:\n"${analysis.transcript}"\n\nAudio: ${containerAudioPath}`;
+}
+
+/**
+ * Fallback transcription chain when faster-whisper is not configured.
+ * Tries whisper.cpp (WHISPER_BIN), then OpenAI Whisper API (OPENAI_API_KEY).
+ * Returns null when neither is available — caller uses "[Voice Message]".
  *
  * Signal voice notes are AAC/ADTS; whisper-cpp wants WAV. ffmpeg is invoked
  * if available to convert; if ffmpeg is missing the local path is skipped.
@@ -525,6 +644,12 @@ export function createSignalAdapter(config: {
   tcpPort: number;
   manageDaemon: boolean;
   signalDataDir: string;
+  /** faster-whisper model size (e.g. "small"). Empty string = disabled. */
+  fasterWhisperModel: string;
+  /** Absolute path to scripts/faster-whisper-transcribe.py on the host. */
+  fasterWhisperScript: string;
+  /** Container-side mount path for signal-cli attachments (no trailing slash). */
+  containerAttachmentsPath: string;
 }): ChannelAdapter {
   let daemon: DaemonHandle | null = null;
   let tcp: SignalTcpClient | null = null;
@@ -620,9 +745,9 @@ export function createSignalAdapter(config: {
 
     let content = text;
 
-    // Voice attachment — try transcription if WHISPER_BIN or OPENAI_API_KEY
-    // is configured; otherwise fall back to the original placeholder so
-    // operators who don't want transcription get the same UX as before.
+    // Voice attachment — analyze with faster-whisper when configured (rich
+    // metrics + transcript), fall back to whisper.cpp / OpenAI transcription,
+    // or produce a plain placeholder if nothing is configured.
     if (hasVoice && audioAttachment?.id) {
       const attachmentPath = join(config.signalDataDir, 'attachments', audioAttachment.id);
       if (existsSync(attachmentPath)) {
@@ -631,12 +756,33 @@ export function createSignalAdapter(config: {
           attachmentId: audioAttachment.id,
           path: attachmentPath,
         });
-        const transcript = await transcribeAudioOptional(attachmentPath);
-        if (transcript) {
-          content = `[Voice: ${transcript}]`;
-          log.info('Signal: voice transcribed', { platformId, length: transcript.length });
+
+        if (config.fasterWhisperModel && config.fasterWhisperScript) {
+          const analysis = await analyzeFasterWhisper(
+            attachmentPath,
+            config.fasterWhisperModel,
+            config.fasterWhisperScript,
+          );
+          if (analysis) {
+            const containerAudioPath = `${config.containerAttachmentsPath}/${audioAttachment.id}`;
+            content = formatVoiceContent(analysis, containerAudioPath);
+            log.info('Signal: voice analyzed (faster-whisper)', {
+              platformId,
+              durationSeconds: analysis.durationSeconds,
+              wordsPerMinute: analysis.wordsPerMinute,
+              pauseCount: analysis.pauseCount,
+            });
+          } else {
+            content = '[Voice Message]';
+          }
         } else {
-          content = '[Voice Message]';
+          const transcript = await transcribeAudioOptional(attachmentPath);
+          if (transcript) {
+            content = `[Voice: ${transcript}]`;
+            log.info('Signal: voice transcribed', { platformId, length: transcript.length });
+          } else {
+            content = '[Voice Message]';
+          }
         }
       } else {
         log.warn('Signal: voice attachment file not found', {
@@ -943,6 +1089,9 @@ registerChannelAdapter('signal', {
       'SIGNAL_CLI_PATH',
       'SIGNAL_MANAGE_DAEMON',
       'SIGNAL_DATA_DIR',
+      'FASTER_WHISPER_MODEL',
+      'FASTER_WHISPER_SCRIPT',
+      'FASTER_WHISPER_CONTAINER_ATTACHMENTS_PATH',
     ]);
 
     const account = process.env.SIGNAL_ACCOUNT || envVars.SIGNAL_ACCOUNT || '';
@@ -958,6 +1107,16 @@ registerChannelAdapter('signal', {
 
     const signalDataDir =
       process.env.SIGNAL_DATA_DIR || envVars.SIGNAL_DATA_DIR || join(homedir(), '.local', 'share', 'signal-cli');
+
+    const fasterWhisperModel = process.env.FASTER_WHISPER_MODEL || envVars.FASTER_WHISPER_MODEL || '';
+    const fasterWhisperScript =
+      process.env.FASTER_WHISPER_SCRIPT ||
+      envVars.FASTER_WHISPER_SCRIPT ||
+      join(process.cwd(), 'scripts', 'faster-whisper-transcribe.py');
+    const containerAttachmentsPath =
+      process.env.FASTER_WHISPER_CONTAINER_ATTACHMENTS_PATH ||
+      envVars.FASTER_WHISPER_CONTAINER_ATTACHMENTS_PATH ||
+      '/workspace/extra/signal-attachments';
 
     // Only check for `signal-cli` on PATH when the operator left cliPath at
     // the default AND asked us to manage the daemon. A custom absolute path
@@ -978,6 +1137,9 @@ registerChannelAdapter('signal', {
       tcpPort,
       manageDaemon,
       signalDataDir,
+      fasterWhisperModel,
+      fasterWhisperScript,
+      containerAttachmentsPath,
     });
   },
 });

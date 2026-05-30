@@ -82,6 +82,9 @@ function createAdapter() {
     tcpPort: 7583,
     manageDaemon: false,
     signalDataDir: '/tmp/signal-cli-test-data',
+    fasterWhisperModel: '',
+    fasterWhisperScript: '',
+    containerAttachmentsPath: '/workspace/extra/signal-attachments',
   });
 }
 
