@@ -291,6 +291,32 @@ After validation has **succeeded**, record that this install reached the new ver
 
 If validation did NOT succeed, do not stamp — leave the tripwire to catch the broken state.
 
+Proceed to Step 7.95.
+
+# Step 7.95: Restart the service (required — do not skip or defer)
+A build alone never reloads a running process, and migrations only execute on
+boot (`runMigrations()` in `src/index.ts` runs once at startup, not on file
+change). If the update touched `src/db/migrations/` and the service isn't
+restarted, the live process keeps running old code against an unmigrated
+schema — any code path that depends on the new tables/columns will fail at
+runtime, silently, until someone eventually restarts it. Treat this step as
+part of validation, not a follow-up the user handles later.
+
+Detect how NanoClaw is running and restart it yourself:
+- `source setup/lib/install-slug.sh`
+- **macOS (Darwin)**: if `launchctl print gui/$(id -u)/$(launchd_label) >/dev/null 2>&1` succeeds, run:
+  `launchctl kickstart -k gui/$(id -u)/$(launchd_label)`
+- **Linux**: if `systemctl --user list-units --type=service | grep -q "$(systemd_unit)"`, run:
+  `systemctl --user restart $(systemd_unit)`
+- **Manual** (no managed service found — e.g. the user runs `pnpm run dev` in a foreground terminal): the skill cannot restart a foreground process for them. Tell the user to stop and re-run `pnpm run dev` now, and wait for their confirmation before proceeding.
+
+Before restarting a managed service, check for containers that would be interrupted mid-task: `docker ps --filter "name=nanoclaw-v2-" --format "{{.Names}}\t{{.Status}}"`. If any are running, note them — the host will re-wake sessions with pending messages automatically afterward, but a container killed mid-turn loses that in-flight work.
+
+After restarting, verify it actually came back up on the new code rather than assuming success:
+- Wait a few seconds, then check the tail of `logs/nanoclaw.log` for a fresh `NanoClaw starting` → `NanoClaw running` pair after the restart.
+- If the merge added or changed files under `src/db/migrations/`, confirm they applied: look for `Running migrations` / `Migration applied` in that same log window, and cross-check with `pnpm exec tsx scripts/q.ts data/v2.db "SELECT name FROM schema_version ORDER BY version DESC LIMIT 6"` — the newest names should match what landed in `src/db/migrations/`.
+- If the service didn't come back cleanly (crash loop, error in `logs/nanoclaw.error.log`, migration failure) — stop here, show the user the error, and do not present Step 8 as a clean success.
+
 Proceed to Step 8.
 
 # Step 8: Summary + rollback instructions
@@ -301,14 +327,12 @@ Show:
 - Conflicts resolved (list files, if any)
 - Breaking changes applied (list skills run, if any)
 - Remaining local diff vs upstream: `git diff --name-only upstream/$UPSTREAM_BRANCH..HEAD`
+- Restart result from Step 7.95: which service was restarted (or that the user restarted a manual `pnpm run dev`), and confirmation that any pending migrations applied
+- Any containers that were interrupted mid-task by the restart (from the Step 7.95 `docker ps` check)
 
 Tell the user:
 - To rollback: `git reset --hard <backup-tag-from-step-1>`
 - Backup branch also exists: `backup/pre-update-<HASH>-<TIMESTAMP>`
-- Restart the service to apply changes. The unit/label names are per-install — derive them with `setup/lib/install-slug.sh`. Run from your NanoClaw project root:
-  - **macOS (Darwin)**: `source setup/lib/install-slug.sh && launchctl kickstart -k gui/$(id -u)/$(launchd_label)`
-  - **Linux**: `source setup/lib/install-slug.sh && systemctl --user restart $(systemd_unit)` (or, if you want to confirm the unit name first: `systemctl --user list-units --type=service | grep "$(. setup/lib/install-slug.sh && systemd_unit)"`)
-  - **Manual** (no service found): restart `pnpm run dev`
 
 
 ## Diagnostics
