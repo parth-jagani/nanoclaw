@@ -16,6 +16,7 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   ONECLI_API_KEY,
+  ONECLI_CONTAINER_NAME,
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
@@ -62,6 +63,85 @@ const activeContainers = new Map<string, { process: ChildProcess; containerName:
  */
 const wakePromises = new Map<string, Promise<boolean>>();
 
+// OneCLI gateway self-healing. A stuck Docker Desktop / WSL2 port-forward
+// for the gateway looks identical to a transient network blip from here
+// (OneCLIError "fetch failed") — we can't tell "will clear on its own" from
+// "needs a container restart" without waiting, so we escalate only after
+// sustained failure across multiple wake attempts, with a cooldown so a
+// genuinely-down gateway doesn't get restart-looped.
+export const ONECLI_FAILURE_ESCALATE_MS = 3 * 60 * 1000;
+export const ONECLI_REMEDIATION_COOLDOWN_MS = 10 * 60 * 1000;
+let oneCliFailureStreakStartedAt: number | null = null;
+let oneCliLastRemediationAt = 0;
+
+export function isOneCliConnectivityError(err: unknown): boolean {
+  return (
+    !!err &&
+    typeof err === 'object' &&
+    (err as { type?: unknown }).type === 'OneCLIError' &&
+    (err as { message?: unknown }).message === 'fetch failed'
+  );
+}
+
+export type OneCliFailureAction =
+  | { action: 'ignore' } // not a connectivity error — nothing to track
+  | { action: 'track-start' } // first failure of a new streak
+  | { action: 'wait' } // streak ongoing but below threshold, or cooling down
+  | { action: 'remediate' }; // sustained streak past threshold, cooldown clear
+
+/** Pure decision, unit-testable without mocking Date.now or execSync. */
+export function decideOneCliFailureAction(args: {
+  err: unknown;
+  now: number;
+  streakStartedAt: number | null;
+  lastRemediationAt: number;
+}): OneCliFailureAction {
+  const { err, now, streakStartedAt, lastRemediationAt } = args;
+  if (!isOneCliConnectivityError(err)) return { action: 'ignore' };
+  if (streakStartedAt === null) return { action: 'track-start' };
+
+  const streakMs = now - streakStartedAt;
+  if (streakMs < ONECLI_FAILURE_ESCALATE_MS) return { action: 'wait' };
+  if (now - lastRemediationAt < ONECLI_REMEDIATION_COOLDOWN_MS) return { action: 'wait' };
+
+  return { action: 'remediate' };
+}
+
+function resetOneCliFailureStreak(): void {
+  oneCliFailureStreakStartedAt = null;
+}
+
+function recordOneCliFailure(err: unknown): void {
+  const now = Date.now();
+  const decision = decideOneCliFailureAction({
+    err,
+    now,
+    streakStartedAt: oneCliFailureStreakStartedAt,
+    lastRemediationAt: oneCliLastRemediationAt,
+  });
+
+  if (decision.action === 'ignore' || decision.action === 'wait') return;
+
+  if (decision.action === 'track-start') {
+    oneCliFailureStreakStartedAt = now;
+    return;
+  }
+
+  // remediate
+  oneCliLastRemediationAt = now;
+  const streakMs = oneCliFailureStreakStartedAt === null ? 0 : now - oneCliFailureStreakStartedAt;
+  log.error('OneCLI gateway unreachable for sustained period — restarting container', {
+    streakMs,
+    container: ONECLI_CONTAINER_NAME,
+  });
+  try {
+    execSync(`docker restart ${ONECLI_CONTAINER_NAME}`, { stdio: 'ignore', timeout: 30_000 });
+    log.info('OneCLI container restart issued', { container: ONECLI_CONTAINER_NAME });
+  } catch (restartErr) {
+    log.error('OneCLI container restart failed', { container: ONECLI_CONTAINER_NAME, err: restartErr });
+  }
+}
+
 export function getActiveContainerCount(): number {
   return activeContainers.size;
 }
@@ -93,9 +173,13 @@ export function wakeContainer(session: Session): Promise<boolean> {
     return existing;
   }
   const promise = spawnContainer(session)
-    .then(() => true)
+    .then(() => {
+      resetOneCliFailureStreak();
+      return true;
+    })
     .catch((err) => {
       log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
+      recordOneCliFailure(err);
       return false;
     })
     .finally(() => {
