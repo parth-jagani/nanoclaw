@@ -39,14 +39,27 @@ Read the current config, show it, ask which entry to remove, write the updated c
 npx tsx setup/index.ts --step mounts --force -- --empty
 ```
 
-## After Changes
+## After Changes — Required 3-Step Protocol
 
-Restart the service so containers pick up the new config (the unit/label names are per-install — see `setup/lib/install-slug.sh`).
+Mount changes require **all three** steps. Missing any one means the change won't take effect.
 
-Run from your NanoClaw project root:
+**1. Update the DB** (`additional_mounts` in `container_configs` — `ncl groups config update` does not handle this field, use direct SQL):
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db "UPDATE container_configs SET additional_mounts = '<json>' WHERE agent_group_id = '<id>'"
+```
+
+**2. Update the allowlist file** (`~/.config/nanoclaw/mount-allowlist.json`) — add the new host path as an allowed root. The file is edited directly (JSON).
+
+**3. Restart the host service** — the allowlist is cached in memory and never reloads until the process restarts. `ncl groups restart` only kills the agent container, NOT the host.
 
 ```bash
+# Linux (this install)
+systemctl --user restart nanoclaw-v2-2515390d.service
+systemctl --user status nanoclaw-v2-2515390d.service   # verify running
+
+# macOS
 source setup/lib/install-slug.sh
-launchctl kickstart -k gui/$(id -u)/$(launchd_label)  # macOS
-systemctl --user restart $(systemd_unit)              # Linux
+launchctl kickstart -k gui/$(id -u)/$(launchd_label)
 ```
+
+After the host restarts, send any message to the agent — it will spawn a fresh container with the new mount wired in.

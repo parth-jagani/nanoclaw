@@ -42,7 +42,7 @@ def main():
         segments.append({"text": seg.text.strip(), "start": seg.start, "end": seg.end})
         if seg.words:
             for w in seg.words:
-                words.append({"word": w.word.strip(), "start": w.start, "end": w.end})
+                words.append({"word": w.word.strip(), "start": w.start, "end": w.end, "confidence": round(w.probability, 3)})
 
     text = " ".join(s["text"] for s in segments)
 

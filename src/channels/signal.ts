@@ -363,6 +363,7 @@ interface AudioAnalysis {
   avgPauseDurationSeconds: number;
   fillerWords: Record<string, number>;
   segments: Array<{ text: string; start: number; end: number }>;
+  wordScores?: Array<{ word: string; confidence: number }>;
 }
 
 const FILLER_WORDS = new Set([
@@ -370,19 +371,19 @@ const FILLER_WORDS = new Set([
   'uh',
   'like',
   'you know',
+  'so',
   'basically',
   'literally',
   'right',
-  'okay',
-  'actually',
-  'just',
-  'so',
+  'kind of',
+  'sort of',
+  'i mean',
 ]);
 
 function computeAudioMetrics(
-  words: Array<{ word: string; start: number; end: number }>,
+  words: Array<{ word: string; start: number; end: number; confidence?: number }>,
   durationSeconds: number,
-): Pick<AudioAnalysis, 'wordsPerMinute' | 'pauseCount' | 'avgPauseDurationSeconds' | 'fillerWords'> {
+): Pick<AudioAnalysis, 'wordsPerMinute' | 'pauseCount' | 'avgPauseDurationSeconds' | 'fillerWords' | 'wordScores'> {
   const wordsPerMinute = durationSeconds > 0 ? Math.round((words.length / durationSeconds) * 60) : 0;
 
   const pauses: number[] = [];
@@ -403,7 +404,17 @@ function computeAudioMetrics(
     if (FILLER_WORDS.has(clean)) fillerWords[clean] = (fillerWords[clean] ?? 0) + 1;
   }
 
-  return { wordsPerMinute, pauseCount, avgPauseDurationSeconds, fillerWords };
+  const wordScores = words
+    .filter((w) => w.confidence !== undefined)
+    .map((w) => ({ word: w.word, confidence: w.confidence! }));
+
+  return {
+    wordsPerMinute,
+    pauseCount,
+    avgPauseDurationSeconds,
+    fillerWords,
+    wordScores: wordScores.length > 0 ? wordScores : undefined,
+  };
 }
 
 /**
@@ -427,7 +438,7 @@ async function analyzeFasterWhisper(
     const parsed = JSON.parse(out) as {
       text: string;
       duration: number;
-      words: Array<{ word: string; start: number; end: number }>;
+      words: Array<{ word: string; start: number; end: number; confidence?: number }>;
       segments: Array<{ text: string; start: number; end: number }>;
     };
     if (!parsed.text || parsed.duration == null) return null;
@@ -469,7 +480,22 @@ function formatVoiceContent(analysis: AudioAnalysis, containerAudioPath: string)
       ...(fillerSummary ? [`Fillers: ${fillerSummary}`] : []),
     ].join(' | ') + ']';
 
-  return `${header}\n\nTranscript:\n"${analysis.transcript}"\n\nAudio: ${containerAudioPath}`;
+  const audioMetadata = JSON.stringify({
+    duration_sec: analysis.durationSeconds,
+    wpm: analysis.wordsPerMinute,
+    pause_count: analysis.pauseCount,
+    pause_avg_ms: Math.round(analysis.avgPauseDurationSeconds * 1000),
+  });
+
+  const parts = [header, `audio_metadata: ${audioMetadata}`];
+
+  if (analysis.wordScores && analysis.wordScores.length > 0) {
+    parts.push(`word_scores: ${JSON.stringify(analysis.wordScores)}`);
+  }
+
+  parts.push(`Transcript:\n"${analysis.transcript}"\n\nAudio: ${containerAudioPath}`);
+
+  return parts.join('\n\n');
 }
 
 /**
@@ -637,6 +663,14 @@ function parseSignalStyles(input: string): StyledText {
  * channelType is always "signal". The router combines channelType + platformId
  * to look up or create the messaging_group.
  */
+// Keywords that trigger deferred voice analysis. Case-insensitive, exact match.
+const VOICE_TRIGGER_KEYWORDS = new Set(['analyze', 'coach this', 'coach', 'go', 'process']);
+const PENDING_AUDIO_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function isVoiceTrigger(text: string): boolean {
+  return VOICE_TRIGGER_KEYWORDS.has(text.trim().toLowerCase());
+}
+
 export function createSignalAdapter(config: {
   cliPath: string;
   account: string;
@@ -656,6 +690,8 @@ export function createSignalAdapter(config: {
   let connected = false;
   const echoCache = new EchoCache();
   let setup: ChannelSetup | null = null;
+  // Keyed by platformId — holds the last received voice note awaiting analysis trigger.
+  const pendingAudio = new Map<string, { attachmentId: string; attachmentPath: string; receivedAt: number }>();
 
   // -- inbound handling --
 
@@ -745,26 +781,49 @@ export function createSignalAdapter(config: {
 
     let content = text;
 
-    // Voice attachment — analyze with faster-whisper when configured (rich
-    // metrics + transcript), fall back to whisper.cpp / OpenAI transcription,
-    // or produce a plain placeholder if nothing is configured.
+    // Voice attachment — queue for deferred analysis. Analysis runs only when
+    // the user follows up with a trigger keyword ("analyze", "coach this",
+    // "coach", "go", or "process"). This avoids burning tokens on recordings
+    // the user hasn't decided to submit yet.
     if (hasVoice && audioAttachment?.id) {
       const attachmentPath = join(config.signalDataDir, 'attachments', audioAttachment.id);
       if (existsSync(attachmentPath)) {
-        log.info('Signal: voice attachment received', {
+        pendingAudio.set(platformId, { attachmentId: audioAttachment.id, attachmentPath, receivedAt: Date.now() });
+        log.info('Signal: voice note queued — awaiting trigger keyword', {
           platformId,
           attachmentId: audioAttachment.id,
-          path: attachmentPath,
         });
+        await sendText(
+          platformId,
+          'Voice note received. Send "analyze" (or "coach this" / "go") to process it with the voice coach.',
+        );
+        return;
+      }
+      log.warn('Signal: voice attachment file not found', { id: audioAttachment.id, path: attachmentPath });
+      content = '[Voice Message - file not found]';
+    }
 
+    // Trigger keyword with pending audio → run analysis now.
+    if (text && isVoiceTrigger(text)) {
+      const pending = pendingAudio.get(platformId);
+      if (pending) {
+        pendingAudio.delete(platformId);
+        if (Date.now() - pending.receivedAt > PENDING_AUDIO_TTL_MS) {
+          await sendText(platformId, 'That voice note expired (10 min limit). Please send a new recording.');
+          return;
+        }
+        log.info('Signal: voice trigger received, starting analysis', {
+          platformId,
+          attachmentId: pending.attachmentId,
+        });
         if (config.fasterWhisperModel && config.fasterWhisperScript) {
           const analysis = await analyzeFasterWhisper(
-            attachmentPath,
+            pending.attachmentPath,
             config.fasterWhisperModel,
             config.fasterWhisperScript,
           );
           if (analysis) {
-            const containerAudioPath = `${config.containerAttachmentsPath}/${audioAttachment.id}`;
+            const containerAudioPath = `${config.containerAttachmentsPath}/${pending.attachmentId}`;
             content = formatVoiceContent(analysis, containerAudioPath);
             log.info('Signal: voice analyzed (faster-whisper)', {
               platformId,
@@ -776,7 +835,7 @@ export function createSignalAdapter(config: {
             content = '[Voice Message]';
           }
         } else {
-          const transcript = await transcribeAudioOptional(attachmentPath);
+          const transcript = await transcribeAudioOptional(pending.attachmentPath);
           if (transcript) {
             content = `[Voice: ${transcript}]`;
             log.info('Signal: voice transcribed', { platformId, length: transcript.length });
@@ -784,13 +843,8 @@ export function createSignalAdapter(config: {
             content = '[Voice Message]';
           }
         }
-      } else {
-        log.warn('Signal: voice attachment file not found', {
-          id: audioAttachment.id,
-          path: attachmentPath,
-        });
-        content = '[Voice Message - file not found]';
       }
+      // If no pending audio, fall through — treat the keyword as a regular message.
     }
 
     // Image attachments — emit `[Image: <path>]` lines so the agent's Read
@@ -994,6 +1048,16 @@ export function createSignalAdapter(config: {
           });
         },
       });
+
+      // In signal-cli 0.14+ daemon TCP mode, each client must explicitly subscribe
+      // to receive `receive` notifications. --receive-mode on-start only starts
+      // signal-cli's internal receive loop; it does not subscribe TCP clients.
+      try {
+        await tcp.rpc('subscribeReceive', { account: config.account });
+        log.debug('Signal: subscribed to receive notifications');
+      } catch (err) {
+        log.warn('Signal: subscribeReceive failed — inbound messages may not arrive', { err });
+      }
 
       try {
         await tcp.rpc('updateProfile', {
